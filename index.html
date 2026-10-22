@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#d6336c">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<title>Manga Translator Local</title>
+<link href="https://fonts.googleapis.com/css2?family=Comic+Neue:wght@700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<style>
+:root{--bg:#f6f5f2;--fg:#1c1c1c;--card:#fff;--ac:#d6336c;--bd:#ddd}
+@media(prefers-color-scheme:dark){:root{--bg:#18181b;--fg:#eee;--card:#26262b;--bd:#3a3a42}}
+*{box-sizing:border-box}body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+main{max-width:900px;margin:auto;padding:16px}
+button,select{min-height:44px}
+h1{font-size:1.5rem}small{opacity:.7}
+#drop{border:2px dashed var(--bd);border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:var(--card)}
+#drop.over{border-color:var(--ac)}
+.row{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;align-items:center}
+select,button{padding:10px 14px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:1rem}
+button.p{background:var(--ac);color:#fff;border:0}button:disabled{opacity:.4}
+#steps{display:flex;gap:6px;margin:12px 0}
+#steps span{flex:1;text-align:center;padding:6px;border-radius:6px;background:var(--card);border:1px solid var(--bd);font-size:.85rem}
+#steps span.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+#bar{height:8px;background:var(--bd);border-radius:4px;overflow:hidden}#bar div{height:100%;width:0;background:var(--ac);transition:width .2s}
+#log{font-size:.85rem;opacity:.75;margin:8px 0;min-height:1.2em}
+#view img{max-width:100%;display:block;margin:0 auto 8px;border-radius:4px}
+.hide{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>Manga Translator — local &amp; gratuit</h1>
+<small>Tout tourne dans le navigateur. Les modèles sont téléchargés une seule fois puis mis en cache.</small>
+
+<div id="drop" class="row" style="display:block;margin-top:16px">Glisse tes images (JPG, PNG) ou un CBZ / ZIP ici, ou clique<input id="file" type="file" multiple accept=".jpg,.jpeg,.png,.cbz,.zip,image/*" class="hide"></div>
+
+<div class="row">
+<label>Langue source :
+<select id="src"><option value="auto">Auto</option><option value="zh">Chinois</option><option value="en">Anglais</option><option value="ja">Japonais</option></select></label>
+<label>Langue cible : <select id="tgt" disabled><option>Français</option></select></label>
+<label><input type="checkbox" id="light"> Mode léger (mobile)</label>
+<button id="go" class="p" disabled>Traduire</button>
+</div>
+
+<div id="steps"><span id="s0">Détection</span><span id="s1">OCR</span><span id="s2">Traduction</span><span id="s3">Écriture</span></div>
+<div id="bar"><div></div></div>
+<div id="log"></div>
+
+<div class="row">
+<button id="vo" disabled>Original</button><button id="vt" disabled>Traduit</button>
+<button id="dl" disabled>Télécharger le chapitre traduit en CBZ</button>
+</div>
+<div id="view"></div>
+</main>
+
+<script type="module">
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2";
+
+// ---- Configuration ----
+const BUBBLE_MODEL = null;   // ex: "mon-compte/mon-yolov8-bulles-onnx" (modèle ONNX compatible transformers.js). null = détection par Tesseract.
+const MANGA_OCR_MODEL = null; // ex: "Xenova/manga-ocr" si tu as un port ONNX valide. null = Tesseract.
+const NLLB = "Xenova/nllb-200-distilled-600M";
+const FONT = "'Comic Neue', 'Comic Sans MS', sans-serif"; // remplace Wild Words (absente de Google Fonts)
+env.allowLocalModels = false;
+
+const $ = id => document.getElementById(id);
+const LANG = { en:["eng","eng_Latn"], ja:["jpn","jpn_Jpan"], zh:["chi_sim","zho_Hans"], ko:["kor","kor_Hang"] };
+let pages = [], mode = "t", detector = null, ocrModel = null;
+const pipes = {};
+const MAXDIM = 2000; // réduction des grandes pages pour économiser la RAM du téléphone
+$("light").checked = /Android/i.test(navigator.userAgent);
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
+
+const getPipe = async (model) => pipes[model] ||= await pipeline("translation", model, { dtype:"q8" });
+async function warm() { await getPipe($("light").checked ? "Xenova/opus-mt-en-fr" : NLLB); }
+async function translate(text, lang) {
+  if ($("light").checked && ["en","ja","zh"].includes(lang)) {
+    let en = text;
+    if (lang !== "en") en = (await (await getPipe(`Xenova/opus-mt-${lang}-en`))(en, { max_length:200 }))[0].translation_text;
+    return (await (await getPipe("Xenova/opus-mt-en-fr"))(en, { max_length:200 }))[0].translation_text;
+  }
+  const out = await (await getPipe(NLLB))(text, { src_lang: LANG[lang][1], tgt_lang:"fra_Latn", max_length:200 });
+  return out[0].translation_text;
+}
+async function downscale(blob) {
+  const bmp = await createImageBitmap(blob);
+  const k = MAXDIM / Math.max(bmp.width, bmp.height);
+  if (k >= 1) { bmp.close(); return blob; }
+  const c = document.createElement("canvas"); c.width = Math.round(bmp.width*k); c.height = Math.round(bmp.height*k);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height); bmp.close();
+  return await new Promise(r => c.toBlob(r, "image/jpeg", 0.92));
+}
+
+const log = t => $("log").textContent = t;
+const step = (i, p) => { [0,1,2,3].forEach(k => $("s"+k).classList.toggle("on", k===i)); $("bar").firstChild.style.width = (p*100)+"%"; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---- Chargement des fichiers ----
+async function addFiles(files) {
+  for (const f of files) {
+    const n = f.name.toLowerCase();
+    if (/\.(cbz|zip)$/.test(n)) {
+      const zip = await JSZip.loadAsync(f);
+      const names = Object.keys(zip.files).filter(k => /\.(jpe?g|png)$/i.test(k) && !zip.files[k].dir).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+      for (const k of names) pages.push({ name:k.split("/").pop(), blob: await zip.files[k].async("blob") });
+    } else if (/\.(jpe?g|png)$/.test(n)) pages.push({ name:f.name, blob:f });
+  }
+  for (const p of pages) if (!p.orig) { p.blob = await downscale(p.blob); p.orig = URL.createObjectURL(p.blob); }
+  log(pages.length + " page(s) chargée(s).");
+  $("go").disabled = !pages.length;
+  render();
+}
+
+const drop = $("drop");
+drop.onclick = () => $("file").click();
+$("file").onchange = e => addFiles([...e.target.files]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); addFiles([...e.dataTransfer.files]); };
+
+// ---- Viewer ----
+function render() {
+  $("view").innerHTML = "";
+  pages.forEach(p => { const i = new Image(); i.src = (mode==="t" && p.trans) || p.orig; $("view").append(i); });
+  const done = pages.some(p => p.trans);
+  $("vo").disabled = $("vt").disabled = $("dl").disabled = !done;
+}
+$("vo").onclick = () => { mode="o"; render(); };
+$("vt").onclick = () => { mode="t"; render(); };
+
+// ---- Utilitaires image ----
+const loadImg = src => new Promise(r => { const i = new Image(); i.onload = () => r(i); i.src = src; });
+function crop(img, b, pad=6) {
+  const x = Math.max(0,b.x-pad), y = Math.max(0,b.y-pad);
+  const w = Math.min(img.width-x,b.w+pad*2), h = Math.min(img.height-y,b.h+pad*2);
+  const c = document.createElement("canvas"); c.width=w; c.height=h;
+  c.getContext("2d").drawImage(img,x,y,w,h,0,0,w,h); return c;
+}
+const scriptOf = t => /[\u3040-\u30ff]/.test(t) ? "ja" : /[\uac00-\ud7af]/.test(t) ? "ko" : /[\u4e00-\u9fff]/.test(t) ? "zh" : "en";
+const clean = (t, l) => (["ja","zh","ko"].includes(l) ? t.replace(/\s+/g,"") : t.replace(/\s+/g," ")).trim();
+
+// ---- Pipeline ----
+async function detect(img, worker) {
+  if (BUBBLE_MODEL) {
+    detector ||= await pipeline("object-detection", BUBBLE_MODEL);
+    const out = await detector(img.src, { threshold: 0.4 });
+    return out.map(o => ({ x:o.box.xmin, y:o.box.ymin, w:o.box.xmax-o.box.xmin, h:o.box.ymax-o.box.ymin }));
+  }
+  const { data } = await worker.recognize(img, {}, { blocks:true });
+  const paras = data.paragraphs || (data.blocks||[]).flatMap(b => b.paragraphs);
+  return paras.filter(p => p.confidence > 40 && p.text.trim().length > 1)
+    .map(p => ({ x:p.bbox.x0, y:p.bbox.y0, w:p.bbox.x1-p.bbox.x0, h:p.bbox.y1-p.bbox.y0, text:p.text }));
+}
+
+async function ocr(img, box, worker, src) {
+  if (box.text) return box.text;
+  const c = crop(img, box);
+  if (MANGA_OCR_MODEL && src === "ja") {
+    ocrModel ||= await pipeline("image-to-text", MANGA_OCR_MODEL);
+    return (await ocrModel(c.toDataURL()))[0].generated_text;
+  }
+  return (await worker.recognize(c)).data.text;
+}
+
+function typeset(ctx, box, text) {
+  const pad = 4, x = box.x-pad, y = box.y-pad, w = box.w+pad*2, h = box.h+pad*2;
+  ctx.fillStyle = "#fff"; ctx.fillRect(x,y,w,h);       // inpainting simple : zone blanche
+  ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let size = Math.min(38, h); size >= 8; size--) {
+    ctx.font = `700 ${size}px ${FONT}`;
+    const lines = []; let cur = "";
+    for (const word of text.split(/\s+/)) {
+      const t = cur ? cur+" "+word : word;
+      if (ctx.measureText(t).width > w-6 && cur) { lines.push(cur); cur = word; } else cur = t;
+    }
+    lines.push(cur);
+    if (lines.length*size*1.1 <= h || size === 8) {
+      let ty = y + (h - lines.length*size*1.1)/2;
+      lines.forEach(l => { ctx.fillText(l, x+w/2, ty, w); ty += size*1.1; });
+      return;
+    }
+  }
+}
+
+$("go").onclick = async () => {
+  $("go").disabled = true;
+  try {
+    const srcSel = $("src").value;
+    const tessLang = srcSel === "auto" ? "eng+jpn+chi_sim+kor" : LANG[srcSel][0];
+    log("Chargement de Tesseract…");
+    const worker = await Tesseract.createWorker(tessLang);
+    log($("light").checked ? "Chargement des petits modèles de traduction (~75 Mo chacun)…" : "Chargement du modèle NLLB (~600 Mo la première fois)…");
+    await warm();
+    await document.fonts.load(`700 20px 'Comic Neue'`);
+
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i], base = i/pages.length, share = 1/pages.length;
+      const img = await loadImg(p.orig);
+      const cv = document.createElement("canvas"); cv.width = img.width; cv.height = img.height;
+      const ctx = cv.getContext("2d"); ctx.drawImage(img,0,0);
+
+      step(0, base); log(`Page ${i+1}/${pages.length} : détection…`);
+      const boxes = await detect(img, worker);
+
+      step(1, base+share*.3); log(`Page ${i+1} : OCR…`);
+      const items = [];
+      for (const b of boxes) {
+        const raw = await ocr(img, b, worker, srcSel);
+        const lang = srcSel === "auto" ? scriptOf(raw) : srcSel;
+        const text = clean(raw, lang);
+        if (text.length > 1) items.push({ b, text, lang });
+      }
+
+      step(2, base+share*.6); log(`Page ${i+1} : traduction…`);
+      for (const it of items) {
+        it.fr = await translate(it.text, it.lang);
+        await sleep(0);
+      }
+
+      step(3, base+share*.9); log(`Page ${i+1} : écriture…`);
+      items.forEach(it => typeset(ctx, it.b, it.fr));
+      p.transBlob = await new Promise(r => cv.toBlob(r, "image/png"));
+      p.trans = URL.createObjectURL(p.transBlob);
+      render();
+    }
+    await worker.terminate();
+    step(3, 1); log("Terminé.");
+  } catch (e) { console.error(e); log("Erreur : " + e.message); }
+  $("go").disabled = false;
+};
+
+// ---- Export CBZ ----
+$("dl").onclick = async () => {
+  const zip = new JSZip();
+  pages.forEach((p,i) => p.transBlob && zip.file(String(i+1).padStart(3,"0")+".png", p.transBlob));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await zip.generateAsync({ type:"blob" }));
+  a.download = "chapitre-traduit.cbz"; a.click();
+};
+</script>
+</body>
+</html>
