@@ -72,10 +72,11 @@ const LANG = { en:["eng","eng_Latn"], ja:["jpn","jpn_Jpan"], zh:["chi_sim","zho_
 let pages = [], mode = "t", detector = null, ocrModel = null;
 const pipes = {};
 const MAXDIM = 2000; // réduction des grandes pages pour économiser la RAM du téléphone
-$("light").checked = /Android/i.test(navigator.userAgent);
+$("light").checked = /Android/i.test(navigator.userAgent) || matchMedia("(pointer:coarse)").matches;
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 
-const getPipe = async (model) => pipes[model] ||= await pipeline("translation", model, { dtype:"q8" });
+const getPipe = async (model) => pipes[model] ||= await pipeline("translation", model, { dtype:"q8",
+  progress_callback: d => { if (d.status === "progress" && d.file) { log(`Téléchargement ${model.split("/").pop()} (${d.file.split("/").pop()}) : ${Math.round(d.progress)} %`); $("bar").firstChild.style.width = d.progress+"%"; } } });
 async function warm() { await getPipe($("light").checked ? "Xenova/opus-mt-en-fr" : NLLB); }
 async function translate(text, lang) {
   if ($("light").checked && ["en","ja","zh"].includes(lang)) {
